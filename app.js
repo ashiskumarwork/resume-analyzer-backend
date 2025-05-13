@@ -26,8 +26,7 @@ mongoose
 // --- START: Production-Ready CORS Configuration ---
 const allowedOrigins = [
   "http://localhost:3000", // For your local frontend development
-  // IMPORTANT: Add your deployed frontend URL here once you have it.
-  // For example: 'https://your-frontend-app-name.vercel.app'
+  "https://resume-analyzer-frontend-gray.vercel.app", // YOUR DEPLOYED FRONTEND URL
 ];
 
 const corsOptions = {
@@ -72,7 +71,7 @@ app.get("/", (req, res) => {
 
 // Global Error Handler (Basic Example - consider more robust error handling)
 app.use((err, req, res, next) => {
-  console.error("Global Error Handler:", err.stack);
+  console.error("Global Error Handler:", err.stack ? err.stack : err); // Log stack or error object
   res.status(err.status || 500).json({
     message: err.message || "An unexpected error occurred.",
     // Optionally, include error details in development but not production
