@@ -5,7 +5,7 @@ const mammoth = require("mammoth");
 const axios = require("axios"); // Make sure axios is required
 const ResumeAnalysis = require("../models/ResumeAnalysis");
 
-// --- START: MODIFIED analyzeWithAI function (keeping your existing improvements) ---
+// --- START: MODIFIED analyzeWithAI function ---
 const analyzeWithAI = async (resumeText, jobRole) => {
   const prompt = `
 You are a resume reviewer. Analyze the following resume for the role of "${jobRole}". Provide:
@@ -41,16 +41,20 @@ ${resumeText}
     const content = response.data.choices[0].message.content;
     console.log(
       "[analyzeWithAI] Step 3: Raw AI Response Content snippet:\n",
-      content ? content.substring(0, 200) + "..." : "N/A"
-    );
+      content ? content.substring(0, 500) + "..." : "N/A"
+    ); // Log a longer snippet
 
     let atsScore = null;
+    // --- CORRECTED REGEX TO HANDLE "ATS Score" and "ATS Compatibility Score/Rating" ---
     const match = content.match(
-      /ATS Compatibility (?:Score|Rating):\s*(\d+(\.\d+)?)\/10/i
+      /ATS(?: Compatibility)? (?:Score|Rating):\s*(\d+(\.\d+)?)\/10/i
     );
+    // --- END CORRECTED REGEX ---
+
     console.log("[analyzeWithAI] Step 4: ATS Score Regex Match Result:", match);
 
     if (match && match[1]) {
+      // Ensure 'match' is not null and 'match[1]' (the capturing group for the number) exists
       atsScore = parseFloat(match[1]);
       console.log(
         "[analyzeWithAI] Step 5: Successfully Parsed ATS Score:",
@@ -58,63 +62,65 @@ ${resumeText}
       );
     } else {
       console.log(
-        "[analyzeWithAI] Step 5: Failed to parse ATS Score from AI response."
+        "[analyzeWithAI] Step 5: Failed to parse ATS Score from AI response. Regex did not match expected pattern."
       );
+      // Optional: Log the content if regex fails to help debug new patterns
+      // console.log("[analyzeWithAI] Content where regex failed:\n", content);
     }
 
     return {
       analysis: content,
-      atsScore: atsScore,
+      atsScore: atsScore, // Will be null if not parsed or if an error occurred
     };
   } catch (aiError) {
     console.error("[analyzeWithAI] CRITICAL ERROR CALLING OPENROUTER AI:");
     if (aiError.response) {
+      // The request was made and the server responded with a status code
+      // that falls out of the range of 2xx
       console.error("AI Error - Data:", aiError.response.data);
       console.error("AI Error - Status:", aiError.response.status);
-      console.error("AI Error - Headers:", aiError.response.headers);
     } else if (aiError.request) {
+      // The request was made but no response was received
       console.error(
         "AI Error - Request (No response received):",
         aiError.request
       );
     } else {
+      // Something happened in setting up the request that triggered an Error
       console.error(
         "AI Error - Message (Error in setting up request):",
         aiError.message
       );
     }
+    // console.error("AI Error Config:", aiError.config); // Optional: Log the config of the failed request
     return {
       analysis:
         "Error: Could not retrieve AI analysis due to an API failure. Please check backend logs.",
-      atsScore: null,
+      atsScore: null, // Ensure atsScore is null if the AI call fails
     };
   }
 };
 // --- END: MODIFIED analyzeWithAI function ---
 
 const handleResumeUpload = async (req, res) => {
-  // 'file' will be accessible throughout this function due to lexical scoping
-  // but it's populated by multer middleware before this handler is called.
-  // It's good practice to check if req.file exists.
+  const file = req.file; // Define file here to access it in catch block if needed
 
   try {
     console.log("[handleResumeUpload] Received request to upload resume.");
-    const jobRole = req.body.jobRole || "Frontend Developer";
+    const jobRole = req.body.jobRole || "Frontend Developer"; // Default job role if not provided
     console.log("[handleResumeUpload] Job Role:", jobRole);
 
-    if (!req.file) {
-      // Check if req.file is populated by multer
-      console.log("[handleResumeUpload] Error: No file uploaded by multer.");
+    if (!file) {
+      console.log("[handleResumeUpload] Error: No file uploaded.");
       return res.status(400).json({ error: "No file uploaded" });
     }
-    const file = req.file; // Assign to local const for clarity if preferred
     console.log(
       "[handleResumeUpload] File received:",
       file.originalname,
       "Size:",
       file.size,
       "Path:",
-      file.path // This will be a path in /tmp/uploads/
+      file.path
     );
 
     const ext = path.extname(file.originalname).toLowerCase();
@@ -133,52 +139,44 @@ const handleResumeUpload = async (req, res) => {
       resumeText = data.value;
     } else {
       console.log("[handleResumeUpload] Error: Unsupported file type:", ext);
-      // No need to clean up here if multer's fileFilter already rejected it,
-      // but if it passed fileFilter and then failed here, cleanup is good.
-      // The fileFilter in routes/resume.js should prevent unsupported types.
+      // Clean up the uploaded file if it's unsupported and exists
+      if (fs.existsSync(file.path)) {
+        fs.unlinkSync(file.path);
+        console.log(
+          "[handleResumeUpload] Cleaned up unsupported file:",
+          file.path
+        );
+      }
       return res
         .status(400)
         .json({ error: "Unsupported file type. Please upload PDF or DOCX." });
     }
 
-    // ---- START: TEMPORARY FILE DELETION (AFTER PARSING, BEFORE AI CALL) ----
-    // We delete the file from /tmp as soon as we have its text content.
-    // If AI call fails, we don't want to leave temp files hanging around.
-    if (file && file.path && fs.existsSync(file.path)) {
-      fs.unlink(file.path, (unlinkErr) => {
-        if (unlinkErr) {
-          console.error(
-            "[handleResumeUpload] Error deleting temporary file after parsing:",
-            file.path,
-            unlinkErr
-          );
-        } else {
-          console.log(
-            "[handleResumeUpload] Successfully deleted temporary file after parsing:",
-            file.path
-          );
-        }
-      });
+    // Clean up the uploaded file from 'uploads/' directory after parsing its content
+    if (fs.existsSync(file.path)) {
+      fs.unlinkSync(file.path);
+      console.log(
+        "[handleResumeUpload] Cleaned up successfully parsed file:",
+        file.path
+      );
     }
-    // ---- END: TEMPORARY FILE DELETION ----
-
     console.log(
       "[handleResumeUpload] File parsed. Extracted text length:",
       resumeText.length
     );
 
+    // Basic text cleaning
     resumeText = resumeText.replace(/\s+/g, " ").trim();
     if (resumeText.length === 0) {
       console.log(
         "[handleResumeUpload] Warning: Extracted resume text is empty after cleaning."
       );
-      // Consider returning an error if text is empty, as AI analysis might not be useful
-      // return res.status(400).json({ error: "Could not extract text from resume or resume is empty." });
     }
 
     console.log("[handleResumeUpload] Calling analyzeWithAI function...");
     const { analysis, atsScore } = await analyzeWithAI(resumeText, jobRole);
 
+    // --- THIS IS A KEY LOGGING POINT ---
     console.log(
       "[handleResumeUpload] ATS Score returned from analyzeWithAI:",
       atsScore
@@ -186,16 +184,17 @@ const handleResumeUpload = async (req, res) => {
     console.log(
       "[handleResumeUpload] Analysis snippet returned from analyzeWithAI:",
       analysis ? analysis.substring(0, 200) + "..." : "N/A"
-    );
+    ); // Log a snippet
+    // --- END OF KEY LOGGING POINT ---
 
     console.log("[handleResumeUpload] Saving analysis to MongoDB...");
     const newAnalysis = await ResumeAnalysis.create({
       fileName: file.originalname,
       jobRole,
-      resumeText,
-      aiFeedback: analysis,
-      atsScore: atsScore,
-      user: req.userId,
+      resumeText, // Storing the cleaned resume text
+      aiFeedback: analysis, // Storing the full AI analysis
+      atsScore: atsScore, // Storing the parsed ATS score (could be null)
+      user: req.userId, // From authMiddleware
     });
     console.log(
       "[handleResumeUpload] Analysis saved with ID:",
@@ -204,12 +203,13 @@ const handleResumeUpload = async (req, res) => {
       atsScore
     );
 
+    // Respond to the client
     res.json({
       success: true,
       jobRole,
-      analysis,
-      atsScore,
-      analysisId: newAnalysis._id,
+      analysis, // Send full analysis back
+      atsScore, // Send parsed ATS score back
+      analysisId: newAnalysis._id, // Send the ID of the new analysis document
     });
   } catch (err) {
     console.error(
