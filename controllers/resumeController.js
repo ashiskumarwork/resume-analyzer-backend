@@ -26,7 +26,7 @@ ${resumeText}
     const response = await axios.post(
       "https://openrouter.ai/api/v1/chat/completions",
       {
-        model: "openai/gpt-3.5-turbo", // Or your preferred model
+        model: "openai/gpt-3.5-turbo-16k", // Or your preferred model
         messages: [{ role: "user", content: prompt }],
       },
       {
