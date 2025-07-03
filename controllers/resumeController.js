@@ -1,11 +1,21 @@
+/**
+ * Resume Controller
+ * Handles resume upload, parsing, AI analysis, and file management
+ */
+
 const fs = require("fs");
 const path = require("path");
 const pdfParse = require("pdf-parse");
 const mammoth = require("mammoth");
-const axios = require("axios"); // Make sure axios is required
+const axios = require("axios");
 const ResumeAnalysis = require("../models/ResumeAnalysis");
 
-// --- START: MODIFIED analyzeWithAI function (keeping your existing improvements) ---
+/**
+ * Analyze resume text using AI service
+ * @param {string} resumeText - Extracted text from resume
+ * @param {string} jobRole - Target job role for analysis
+ * @returns {Object} Analysis result with feedback and ATS score
+ */
 const analyzeWithAI = async (resumeText, jobRole) => {
   const prompt = `
 You are a resume reviewer. Analyze the following resume for the role of "${jobRole}". Provide:
@@ -18,15 +28,14 @@ Resume:
 ${resumeText}
 `;
 
-  console.log(
-    `[analyzeWithAI] Step 1: Preparing to call AI for job role: "${jobRole}"`
-  );
+  console.log(`[AI Analysis] Starting analysis for job role: "${jobRole}"`);
 
   try {
+    // Call OpenRouter AI API
     const response = await axios.post(
       "https://openrouter.ai/api/v1/chat/completions",
       {
-        model: "openai/gpt-3.5-turbo-16k", // Or your preferred model
+        model: "openai/gpt-3.5-turbo-16k",
         messages: [{ role: "user", content: prompt }],
       },
       {
@@ -37,29 +46,20 @@ ${resumeText}
       }
     );
 
-    console.log("[analyzeWithAI] Step 2: AI API Call Successful.");
+    console.log("[AI Analysis] API call successful");
     const content = response.data.choices[0].message.content;
-    console.log(
-      "[analyzeWithAI] Step 3: Raw AI Response Content snippet:\n",
-      content ? content.substring(0, 200) + "..." : "N/A"
-    );
 
+    // Extract ATS score from AI response
     let atsScore = null;
-    const match = content.match(
-      /ATS(?: Compatibility)? (?:Score|Rating):\s*(\d+(\.\d+)?)\/10/i
+    const scoreMatch = content.match(
+      /ATS(?: Compatibility)? (?:Score|Rating):\s*(\d+(?:\.\d+)?)\/10/i
     );
-    console.log("[analyzeWithAI] Step 4: ATS Score Regex Match Result:", match);
 
-    if (match && match[1]) {
-      atsScore = parseFloat(match[1]);
-      console.log(
-        "[analyzeWithAI] Step 5: Successfully Parsed ATS Score:",
-        atsScore
-      );
+    if (scoreMatch && scoreMatch[1]) {
+      atsScore = Number.parseFloat(scoreMatch[1]);
+      console.log("[AI Analysis] ATS Score extracted:", atsScore);
     } else {
-      console.log(
-        "[analyzeWithAI] Step 5: Failed to parse ATS Score from AI response."
-      );
+      console.log("[AI Analysis] Could not extract ATS score from response");
     }
 
     return {
@@ -67,22 +67,12 @@ ${resumeText}
       atsScore: atsScore,
     };
   } catch (aiError) {
-    console.error("[analyzeWithAI] CRITICAL ERROR CALLING OPENROUTER AI:");
-    if (aiError.response) {
-      console.error("AI Error - Data:", aiError.response.data);
-      console.error("AI Error - Status:", aiError.response.status);
-      console.error("AI Error - Headers:", aiError.response.headers);
-    } else if (aiError.request) {
-      console.error(
-        "AI Error - Request (No response received):",
-        aiError.request
-      );
-    } else {
-      console.error(
-        "AI Error - Message (Error in setting up request):",
-        aiError.message
-      );
-    }
+    console.error("[AI Analysis] Error calling OpenRouter AI:", {
+      message: aiError.message,
+      status: aiError.response?.status,
+      data: aiError.response?.data,
+    });
+
     return {
       analysis:
         "Error: Could not retrieve AI analysis due to an API failure. Please check backend logs.",
@@ -90,105 +80,112 @@ ${resumeText}
     };
   }
 };
-// --- END: MODIFIED analyzeWithAI function ---
 
+/**
+ * Extract text content from uploaded file
+ * @param {Object} file - Multer file object
+ * @returns {string} Extracted text content
+ */
+const extractTextFromFile = async (file) => {
+  const ext = path.extname(file.originalname).toLowerCase();
+  let resumeText = "";
+
+  console.log(`[File Processing] Extracting text from ${ext} file`);
+
+  if (ext === ".pdf") {
+    const dataBuffer = fs.readFileSync(file.path);
+    const pdfData = await pdfParse(dataBuffer);
+    resumeText = pdfData.text;
+  } else if (ext === ".docx") {
+    const data = await mammoth.extractRawText({ path: file.path });
+    resumeText = data.value;
+  } else {
+    throw new Error(`Unsupported file type: ${ext}`);
+  }
+
+  // Clean and normalize text
+  resumeText = resumeText.replace(/\s+/g, " ").trim();
+
+  if (resumeText.length === 0) {
+    console.warn("[File Processing] Warning: Extracted text is empty");
+  }
+
+  return resumeText;
+};
+
+/**
+ * Clean up temporary file
+ * @param {string} filePath - Path to file to be deleted
+ */
+const cleanupTempFile = (filePath) => {
+  if (filePath && fs.existsSync(filePath)) {
+    fs.unlink(filePath, (unlinkErr) => {
+      if (unlinkErr) {
+        console.error(
+          `[Cleanup] Error deleting temporary file: ${filePath}`,
+          unlinkErr
+        );
+      } else {
+        console.log(
+          `[Cleanup] Successfully deleted temporary file: ${filePath}`
+        );
+      }
+    });
+  }
+};
+
+/**
+ * Handle resume upload and analysis
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
 const handleResumeUpload = async (req, res) => {
-  // 'file' will be accessible throughout this function due to lexical scoping
-  // but it's populated by multer middleware before this handler is called.
-  // It's good practice to check if req.file exists.
-
   try {
-    console.log("[handleResumeUpload] Received request to upload resume.");
-    const jobRole = req.body.jobRole || "Frontend Developer";
-    console.log("[handleResumeUpload] Job Role:", jobRole);
+    console.log("[Resume Upload] Processing resume upload request");
 
+    const jobRole = req.body.jobRole || "Frontend Developer";
+    console.log(`[Resume Upload] Job Role: ${jobRole}`);
+
+    // Validate file upload
     if (!req.file) {
-      // Check if req.file is populated by multer
-      console.log("[handleResumeUpload] Error: No file uploaded by multer.");
+      console.log("[Resume Upload] Error: No file uploaded");
       return res.status(400).json({ error: "No file uploaded" });
     }
-    const file = req.file; // Assign to local const for clarity if preferred
+
+    const file = req.file;
     console.log(
-      "[handleResumeUpload] File received:",
-      file.originalname,
-      "Size:",
-      file.size,
-      "Path:",
-      file.path // This will be a path in /tmp/uploads/
+      `[Resume Upload] File received: ${file.originalname} (${file.size} bytes)`
     );
 
-    const ext = path.extname(file.originalname).toLowerCase();
-    let resumeText = "";
-
-    console.log(
-      "[handleResumeUpload] Parsing file content for extension:",
-      ext
-    );
-    if (ext === ".pdf") {
-      const dataBuffer = fs.readFileSync(file.path);
-      const pdfData = await pdfParse(dataBuffer);
-      resumeText = pdfData.text;
-    } else if (ext === ".docx") {
-      const data = await mammoth.extractRawText({ path: file.path });
-      resumeText = data.value;
-    } else {
-      console.log("[handleResumeUpload] Error: Unsupported file type:", ext);
-      // No need to clean up here if multer's fileFilter already rejected it,
-      // but if it passed fileFilter and then failed here, cleanup is good.
-      // The fileFilter in routes/resume.js should prevent unsupported types.
-      return res
-        .status(400)
-        .json({ error: "Unsupported file type. Please upload PDF or DOCX." });
-    }
-
-    // ---- START: TEMPORARY FILE DELETION (AFTER PARSING, BEFORE AI CALL) ----
-    // We delete the file from /tmp as soon as we have its text content.
-    // If AI call fails, we don't want to leave temp files hanging around.
-    if (file && file.path && fs.existsSync(file.path)) {
-      fs.unlink(file.path, (unlinkErr) => {
-        if (unlinkErr) {
-          console.error(
-            "[handleResumeUpload] Error deleting temporary file after parsing:",
-            file.path,
-            unlinkErr
-          );
-        } else {
-          console.log(
-            "[handleResumeUpload] Successfully deleted temporary file after parsing:",
-            file.path
-          );
-        }
+    // Extract text from uploaded file
+    let resumeText;
+    try {
+      resumeText = await extractTextFromFile(file);
+      console.log(
+        `[Resume Upload] Text extracted successfully (${resumeText.length} characters)`
+      );
+    } catch (extractError) {
+      console.error("[Resume Upload] Error extracting text:", extractError);
+      cleanupTempFile(file.path);
+      return res.status(400).json({
+        error:
+          "Could not extract text from file. Please ensure it's a valid PDF or DOCX file.",
       });
     }
-    // ---- END: TEMPORARY FILE DELETION ----
 
-    console.log(
-      "[handleResumeUpload] File parsed. Extracted text length:",
-      resumeText.length
-    );
+    // Clean up temporary file after text extraction
+    cleanupTempFile(file.path);
 
-    resumeText = resumeText.replace(/\s+/g, " ").trim();
-    if (resumeText.length === 0) {
-      console.log(
-        "[handleResumeUpload] Warning: Extracted resume text is empty after cleaning."
-      );
-      // Consider returning an error if text is empty, as AI analysis might not be useful
-      // return res.status(400).json({ error: "Could not extract text from resume or resume is empty." });
-    }
-
-    console.log("[handleResumeUpload] Calling analyzeWithAI function...");
+    // Analyze resume with AI
+    console.log("[Resume Upload] Starting AI analysis...");
     const { analysis, atsScore } = await analyzeWithAI(resumeText, jobRole);
 
     console.log(
-      "[handleResumeUpload] ATS Score returned from analyzeWithAI:",
-      atsScore
-    );
-    console.log(
-      "[handleResumeUpload] Analysis snippet returned from analyzeWithAI:",
-      analysis ? analysis.substring(0, 200) + "..." : "N/A"
+      `[Resume Upload] AI analysis completed. ATS Score: ${atsScore}`
     );
 
-    console.log("[handleResumeUpload] Saving analysis to MongoDB...");
+    // Save analysis to database
+    console.log("[Resume Upload] Saving analysis to database...");
     const newAnalysis = await ResumeAnalysis.create({
       fileName: file.originalname,
       jobRole,
@@ -197,13 +194,10 @@ const handleResumeUpload = async (req, res) => {
       atsScore: atsScore,
       user: req.userId,
     });
-    console.log(
-      "[handleResumeUpload] Analysis saved with ID:",
-      newAnalysis._id,
-      "ATS Score saved:",
-      atsScore
-    );
 
+    console.log(`[Resume Upload] Analysis saved with ID: ${newAnalysis._id}`);
+
+    // Return success response
     res.json({
       success: true,
       jobRole,
@@ -212,36 +206,20 @@ const handleResumeUpload = async (req, res) => {
       analysisId: newAnalysis._id,
     });
   } catch (err) {
-    console.error(
-      "[handleResumeUpload] CRITICAL ERROR in handleResumeUpload:",
-      err.name,
-      err.message,
-      err.stack // Log more error details
-    );
-    // Attempt to clean up the uploaded file if an error occurs and file.path exists AND it wasn't deleted yet.
-    // Note: if the error happened *after* the planned deletion, this won't do anything new.
-    // If the error happened *before* parsing, `req.file` might be populated by multer, but it might not have been read yet.
-    if (req.file && req.file.path && fs.existsSync(req.file.path)) {
-      // Use req.file.path
-      fs.unlink(req.file.path, (unlinkErr) => {
-        // Use req.file.path
-        if (unlinkErr) {
-          console.error(
-            "[handleResumeUpload] Error cleaning up file from /tmp after an error:",
-            req.file.path, // Use req.file.path
-            unlinkErr
-          );
-        } else {
-          console.log(
-            "[handleResumeUpload] Cleaned up file from /tmp due to an error:",
-            req.file.path // Use req.file.path
-          );
-        }
-      });
+    console.error("[Resume Upload] Critical error:", {
+      name: err.name,
+      message: err.message,
+      stack: err.stack,
+    });
+
+    // Cleanup file if error occurs
+    if (req.file && req.file.path) {
+      cleanupTempFile(req.file.path);
     }
-    res
-      .status(500)
-      .json({ error: "Failed to process resume. Please check server logs." });
+
+    res.status(500).json({
+      error: "Failed to process resume. Please check server logs.",
+    });
   }
 };
 

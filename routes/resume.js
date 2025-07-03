@@ -1,150 +1,202 @@
+/**
+ * Resume Routes
+ * Handles resume upload, analysis, history, and PDF generation endpoints
+ */
+
 const express = require("express");
 const router = express.Router();
 const multer = require("multer");
 const PDFDocument = require("pdfkit");
-const path = require("path"); // Added for path.extname
-const fs = require("fs"); // Added for file system operations
+const path = require("path");
+const fs = require("fs");
 
 const { handleResumeUpload } = require("../controllers/resumeController");
 const ResumeAnalysis = require("../models/ResumeAnalysis");
 const authMiddleware = require("../middleware/authMiddleware");
 
-// --- START: Modified Multer Configuration for Serverless Environment ---
-const UPLOAD_DIR = "/tmp/uploads"; // Use /tmp directory
+// =============================================================================
+// Multer Configuration for File Uploads
+// =============================================================================
 
-// Ensure the UPLOAD_DIR exists (important for serverless ephemeral file systems)
-if (!fs.existsSync(UPLOAD_DIR)) {
-  try {
-    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-    console.log(`Created temporary upload directory: ${UPLOAD_DIR}`);
-  } catch (err) {
-    console.error(
-      `Error creating temporary upload directory ${UPLOAD_DIR}:`,
-      err
-    );
-    // Depending on your error handling strategy, you might throw an error here
-    // or have the application fail to start if this directory is critical.
-  }
-}
+const UPLOAD_DIR = "/tmp/uploads"; // Temporary directory for serverless environments
 
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    // Re-check and create if necessary, as /tmp might be cleared between invocations
-    if (!fs.existsSync(UPLOAD_DIR)) {
-      try {
-        fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-        console.log(
-          `Re-created temporary upload directory in destination cb: ${UPLOAD_DIR}`
-        );
-      } catch (err) {
-        console.error(
-          `Error re-creating temporary upload directory in destination cb ${UPLOAD_DIR}:`,
-          err
-        );
-        return cb(err); // Pass error to multer if directory creation fails
-      }
+/**
+ * Ensure upload directory exists
+ */
+const ensureUploadDir = () => {
+  if (!fs.existsSync(UPLOAD_DIR)) {
+    try {
+      fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+      console.log(`Created temporary upload directory: ${UPLOAD_DIR}`);
+    } catch (err) {
+      console.error(`Error creating upload directory ${UPLOAD_DIR}:`, err);
+      throw err;
     }
+  }
+};
+
+// Create upload directory on module load
+ensureUploadDir();
+
+/**
+ * Multer storage configuration
+ */
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    // Ensure directory exists for each upload
+    ensureUploadDir();
     cb(null, UPLOAD_DIR);
   },
-  filename: function (req, file, cb) {
-    // Using a more unique filename structure
+  filename: (req, file, cb) => {
+    // Generate unique filename to prevent conflicts
     const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(
-      null,
-      file.fieldname + "-" + uniqueSuffix + path.extname(file.originalname)
-    );
+    const filename =
+      file.fieldname + "-" + uniqueSuffix + path.extname(file.originalname);
+    cb(null, filename);
   },
 });
 
+/**
+ * File filter for allowed file types
+ */
+const fileFilter = (req, file, cb) => {
+  const allowedTypes = /pdf|doc|docx/;
+  const mimeTypeValid = allowedTypes.test(file.mimetype);
+  const extNameValid = allowedTypes.test(
+    path.extname(file.originalname).toLowerCase()
+  );
+
+  if (mimeTypeValid && extNameValid) {
+    return cb(null, true);
+  }
+
+  cb(new Error("Only PDF, DOC, and DOCX files are allowed"));
+};
+
+/**
+ * Multer upload configuration
+ */
 const upload = multer({
   storage: storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // Example: 10MB file size limit
-  fileFilter: function (req, file, cb) {
-    // Example file filter: accept only specified types
-    const filetypes = /pdf|doc|docx/; // Regular expression for allowed extensions
-    const mimetype = filetypes.test(file.mimetype);
-    const extname = filetypes.test(
-      path.extname(file.originalname).toLowerCase()
-    );
-
-    if (mimetype && extname) {
-      return cb(null, true);
-    }
-    cb(
-      new Error(
-        "File upload only supports the following filetypes - " + filetypes
-      )
-    );
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB file size limit
+    files: 1, // Only allow single file upload
   },
+  fileFilter: fileFilter,
 });
-// --- END: Modified Multer Configuration ---
 
-// ✅ Route: Upload resume
+// =============================================================================
+// Route Handlers
+// =============================================================================
+
+/**
+ * Upload and analyze resume
+ * POST /api/resume/upload
+ */
 router.post(
   "/upload",
   authMiddleware,
-  upload.single("resume"), // Uses the modified 'upload' instance
+  upload.single("resume"),
   handleResumeUpload
 );
 
-// ✅ Route: Get user’s resume history
+/**
+ * Get user's resume analysis history
+ * GET /api/resume/history
+ */
 router.get("/history", authMiddleware, async (req, res) => {
   try {
+    console.log(`[History] Fetching resume history for user: ${req.userId}`);
+
     const history = await ResumeAnalysis.find({ user: req.userId })
-      .sort({ createdAt: -1 })
-      .select("fileName jobRole createdAt atsScore aiFeedback");
+      .sort({ createdAt: -1 }) // Most recent first
+      .select("fileName jobRole createdAt atsScore aiFeedback")
+      .lean(); // Use lean() for better performance
+
+    console.log(`[History] Found ${history.length} resume analyses`);
 
     res.json({ success: true, history });
   } catch (err) {
-    console.error("Error fetching history:", err); // Added console.error for server-side logging
-    res.status(500).json({ error: "Failed to fetch history" });
+    console.error("[History] Error fetching resume history:", err);
+    res.status(500).json({ error: "Failed to fetch resume history" });
   }
 });
 
-// ✅ Route: Download resume feedback as PDF
+/**
+ * Download resume feedback as PDF
+ * GET /api/resume/download/:id
+ */
 router.get("/download/:id", authMiddleware, async (req, res) => {
   try {
-    const resume = await ResumeAnalysis.findById(req.params.id);
+    const resumeId = req.params.id;
+    console.log(`[Download] Generating PDF for resume: ${resumeId}`);
+
+    // Find resume analysis and verify ownership
+    const resume = await ResumeAnalysis.findById(resumeId).lean();
 
     if (!resume || resume.user.toString() !== req.userId) {
-      return res.status(404).json({ error: "Resume not found" });
+      console.log(`[Download] Resume not found or access denied: ${resumeId}`);
+      return res.status(404).json({ error: "Resume analysis not found" });
     }
 
-    const doc = new PDFDocument();
-    // Sanitize filename for header - basic example, might need more robust sanitization
+    // Create PDF document
+    const doc = new PDFDocument({ margin: 50 });
+
+    // Set response headers for PDF download
     const safeFileName = resume.fileName
       ? resume.fileName.replace(/[^a-zA-Z0-9_.-]/g, "_")
       : "resume";
+
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename=${safeFileName}-feedback.pdf`
+      `attachment; filename="${safeFileName}-feedback.pdf"`
     );
     res.setHeader("Content-Type", "application/pdf");
+
+    // Pipe PDF to response
     doc.pipe(res);
 
-    doc.fontSize(16).text("Resume Feedback Report", { align: "center" });
-    doc.moveDown();
+    // Add content to PDF
+    doc.fontSize(18).text("Resume Feedback Report", { align: "center" });
+    doc.moveDown(2);
 
-    doc.fontSize(12).text(`Original Filename: ${resume.fileName || "N/A"}`);
-    doc.text(`Job Role: ${resume.jobRole || "N/A"}`);
-    doc.text(
-      `Date Analyzed: ${
-        resume.createdAt ? resume.createdAt.toLocaleDateString() : "N/A"
-      }`
-    );
-    doc.text(`ATS Score: ${resume.atsScore ?? "Not Available"}`); // Using nullish coalescing
-    doc.moveDown();
+    // Resume details section
+    doc.fontSize(14).text("Resume Details", { underline: true });
+    doc.moveDown(0.5);
+    doc
+      .fontSize(12)
+      .text(`Original Filename: ${resume.fileName || "N/A"}`)
+      .text(`Job Role: ${resume.jobRole || "N/A"}`)
+      .text(
+        `Date Analyzed: ${
+          resume.createdAt ? resume.createdAt.toLocaleDateString() : "N/A"
+        }`
+      )
+      .text(
+        `ATS Score: ${
+          resume.atsScore !== null ? `${resume.atsScore}/10` : "Not Available"
+        }`
+      );
 
-    doc.fontSize(13).text("AI Feedback:", { underline: true });
-    doc.moveDown();
+    doc.moveDown(2);
+
+    // AI feedback section
+    doc.fontSize(14).text("AI Feedback", { underline: true });
+    doc.moveDown(0.5);
     doc.fontSize(11).text(resume.aiFeedback || "No AI feedback available.", {
       align: "left",
+      lineGap: 2,
     });
 
+    // Finalize PDF
     doc.end();
+
+    console.log(
+      `[Download] PDF generated successfully for resume: ${resumeId}`
+    );
   } catch (err) {
-    console.error("Error generating PDF:", err); // Added console.error
-    res.status(500).json({ error: "Failed to generate PDF" });
+    console.error("[Download] Error generating PDF:", err);
+    res.status(500).json({ error: "Failed to generate PDF report" });
   }
 });
 
